@@ -1,0 +1,114 @@
+# 做预测所需代码：
+# import all kinds of tools
+import astropy
+import gc
+import astropy.io.fits as pyfits
+import galpy
+from galpy.util.coords import radec_to_lb
+import numpy as np
+from astropy.io.votable import parse
+from astropy.io import fits
+from dustmaps.sfd import SFDQuery
+from astropy.coordinates import SkyCoord
+from xgboost import XGBClassifier
+class si:
+    bp_coeffs = None
+def read_data():
+    dat = pyfits.open("/home/yupengy/ext_coeffs.fits")
+    si.bp_coeffs = dat['BP_COEFF'].data
+    si.rp_coeffs = dat['RP_COEFF'].data
+    si.bp_scale = dat['BP_SCALE'].data
+    si.rp_scale = dat['RP_SCALE'].data
+    si.bp_cens = dat['BP_CEN'].data
+    si.rp_cens = dat['RP_CEN'].data
+def correct(ebv, bp_vec0, rp_vec0):
+    if si.bp_coeffs is None:
+        read_data()
+    if bp_vec0.ndim == 1:
+        bp_vec = bp_vec0[None, :]
+        rp_vec = rp_vec0[None, :]
+        ebv = np.atleast_1d(ebv)
+    else:
+        bp_vec, rp_vec = bp_vec0, rp_vec0
+    nparam = si.bp_coeffs.shape[1] - 1
+    bp_vec1 = bp_vec - (np.dot(
+        (bp_vec[:, :nparam] - si.bp_cens) / si.bp_scale,
+        si.bp_coeffs[:, :nparam].T,
+    ) * ebv[:, None] + si.bp_coeffs[:, nparam] * ebv[:, None]**2)
+    rp_vec1 = rp_vec - (np.dot((rp_vec[:, :nparam] - si.rp_cens) / si.rp_scale,
+                               si.rp_coeffs[:, :nparam].T) * ebv[:, None] +
+                        si.rp_coeffs[:, nparam] * ebv[:, None]**2)
+    if bp_vec0.ndim == 1:
+        print('x', bp_vec1.shape)
+        bp_vec1, rp_vec1 = bp_vec1[0], rp_vec1[0]
+    return bp_vec1, rp_vec1
+
+def get_x(coeff, ra, dec, start_point, length):
+  # normalize coefficients
+  bp_normal = np.tile(coeff[:,0].reshape(len(coeff), 1),(1,55))
+  rp_normal = np.tile(coeff[:,55].reshape(len(coeff), 1),(1,55))
+  bp_rp_normal = np.append(bp_normal, rp_normal, axis = 1)
+  nomalized_coeff = coeff/bp_rp_normal
+  # get ebv
+  RA = ra[start_point:(start_point+length)]
+  DEC = dec[start_point:(start_point+length)]
+  l_b = radec_to_lb(RA, DEC, degree=True)
+  l = l_b[:, 0]
+  b = l_b[:, 1]
+  sfd = SFDQuery()
+  c = SkyCoord(l, b, frame='galactic', unit='deg')
+  ebv = sfd(c)
+  # reddening correction
+  bp_corebv_normalized, rp_corebv_normalized = correct(ebv, nomalized_coeff[:, 0:55], nomalized_coeff[:, 55:110])
+  coeff_corebv_normalized = np.concatenate((bp_corebv_normalized, rp_corebv_normalized), axis = 1)
+  return coeff_corebv_normalized
+
+
+# import xgboost model
+xgbc = XGBClassifier()
+xgbc.load_model("/home/yupengy/model")
+# import source_id, ra, dec
+sid_ra_dec = fits.open("/home/yupengy/sid_ra_dec.fits.gz")
+data = sid_ra_dec[1].data
+source_id_list = data['source_id']
+ra = data['ra']
+dec = data['dec']
+print('finish loading sid_ra_dec')
+input_root = "/project2/alexji/GaiaDR3/xp_continuous/"
+filenames = np.loadtxt("/home/yupengy/_fits_files.txt", dtype = 'str')
+
+def predict(filename):
+  try:
+      # import one gaia_coefficients file
+      hdul = fits.open(input_root + filename)
+      data = hdul[1].data
+      source_id = data['source_id']
+      coeff = data['coefficients']
+      # get its start position
+      start_point = np.where(source_id_list==source_id[0])[0][0]
+      print('start point is:', start_point)
+      if (source_id_list[start_point:(start_point+len(source_id))] == source_id).all():
+        print(filename+'开始执行')
+        coeff_corebv_normalized = get_x(coeff, ra, dec, start_point, len(source_id))
+        # predict
+        proba = xgbc.predict_proba(coeff_corebv_normalized)
+
+        c1 = fits.Column(name='source_id', array=source_id, format='K')
+        c2 = fits.Column(name='prob', array=proba, format='7D')
+        t = fits.BinTableHDU.from_columns([c1, c2])
+        t.writeto("/project2/alexji/gaia_prob/"+filename[25:-8]+'_Gaia_prob_table.fits', overwrite = True)
+        print('完成对文件'+filename[25:-8]+'的预测')
+        hdul.close()
+      else:
+        pass
+  except Exception as e:
+      print(e)
+      pass
+"""
+for filename in filenames:
+  predict(filename)
+"""
+from joblib import Parallel, delayed
+Parallel(n_jobs=28)(delayed(predict)(filename) for filename in filenames)
+
+#sinteractive --exclusive --partition=broadwl --nodes=1 --time=12:00:00 --ntasks-per-node=28 --mem-per-cpu=2000
